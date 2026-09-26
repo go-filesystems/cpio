@@ -44,6 +44,21 @@ mtime — everything the header said, and nothing invented.
   zero once, and the walk re-read record one for ever. The suite reported a
   ten-minute timeout, not a failure.
 
+## The inode is read, and is not portable across the variants
+
+`Record.Inode` is the number the header records, because a consumer reads it —
+`go-filesystems/rpm` reports it in `Stat` — and a parser that dropped it would
+force that consumer to invent one.
+
+⛔ **It does not mean the same thing in every variant.** odc's field is six octal
+digits and the old binary variant's is a 16-bit word, so neither can hold a real
+inode: `cpio(1)` **renumbers** them 1..n when it writes those. Measured on one tree —
+`257757054` in newc, `1` in both of the others. A caller using it as an identity
+across two archives of the same files will be wrong.
+
+It is also not unique within one archive: a cpio records hard links by repeating an
+inode.
+
 ## `Record.Name` is the name as recorded
 
 Not a clean path. GNU cpio writes `./real.txt` where other writers write

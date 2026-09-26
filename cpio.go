@@ -70,6 +70,20 @@ type Record struct {
 	// not left to the caller.
 	Link  string
 	MTime time.Time
+	// Inode is the number the header records. It is kept because a consumer reads
+	// it -- go-filesystems/rpm reports it in Stat -- and because a parser that
+	// dropped it would force that consumer to invent one, which is a different
+	// number wearing the same name.
+	//
+	// It is NOT unique in general: a cpio records hard links by repeating an inode,
+	// and an archive concatenated from two others can repeat one by accident.
+	//
+	// ⛔ And it is NOT portable across the variants. odc's field is six octal digits
+	// and the old binary variant's is a 16-bit word, so neither can hold a real
+	// inode -- cpio(1) RENUMBERS them 1..n when it writes those. Measured: one tree
+	// came out as 257757054 in newc and as 1 in both of the others. A caller using
+	// it as an identity across two archives of the same files will be wrong.
+	Inode uint64
 }
 
 // Records reads every record in the archive.
@@ -181,6 +195,7 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	field := func(i int) (int64, error) {
 		return strconv.ParseInt(string(h[6+i*8:6+i*8+8]), 16, 64)
 	}
+	ino, _ := field(0)
 	mode, err := field(1)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: mode at %d: %w", off, err)
@@ -215,7 +230,10 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
 			name, fileSize, ErrTruncated)
 	}
-	return newRecord(ra, name, mode, fileSize, dataOff, mtime, next)
+	return newRecord(ra, header{
+		name: name, mode: mode, size: fileSize, dataOff: dataOff,
+		mtime: mtime, ino: ino, next: next,
+	})
 }
 
 // readODC reads one POSIX.1 octal header.
@@ -232,6 +250,7 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	oct := func(start, width int) (int64, error) {
 		return strconv.ParseInt(strings.TrimSpace(string(h[start:start+width])), 8, 64)
 	}
+	ino, _ := oct(12, 6)
 	mode, err := oct(18, 6)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: mode at %d: %w", off, err)
@@ -263,7 +282,10 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
 			name, fileSize, ErrTruncated)
 	}
-	return newRecord(ra, name, mode, fileSize, dataOff, mtime, next)
+	return newRecord(ra, header{
+		name: name, mode: mode, size: fileSize, dataOff: dataOff,
+		mtime: mtime, ino: ino, next: next,
+	})
 }
 
 // newRecord turns one parsed header into a record, reading a symlink's target.
@@ -272,25 +294,42 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 // loop read header one for ever -- the suite reported a ten-minute TIMEOUT rather
 // than a failure. Same shape as the joined reader's loop the same afternoon:
 // a position that the data is allowed to leave unchanged.
-func newRecord(ra io.ReaderAt, name string, mode, fileSize, dataOff, mtime, next int64) (*Record, int64, error) {
+// header is what a variant's parser read out, in the one shape newRecord takes.
+//
+// ⛔ A struct rather than eight positional arguments, and `next` is a FIELD of it
+// for the reason the comment above gives: it is carried, never recomputed. Eight
+// bare int64s in a row is also how the wrong one gets passed in the wrong place,
+// silently, since they all have the same type.
+type header struct {
+	name    string
+	mode    int64
+	size    int64
+	dataOff int64
+	mtime   int64
+	ino     int64
+	next    int64
+}
+
+func newRecord(ra io.ReaderAt, h header) (*Record, int64, error) {
 	r := &Record{
-		Name:   name,
-		Mode:   FileMode(mode),
-		Size:   fileSize,
-		Offset: dataOff,
-		MTime:  time.Unix(mtime, 0),
+		Name:   h.name,
+		Mode:   FileMode(h.mode),
+		Size:   h.size,
+		Offset: h.dataOff,
+		MTime:  time.Unix(h.mtime, 0),
+		Inode:  uint64(h.ino),
 	}
 	// A symlink's target IS its data, and the size is the target's length. It has
 	// to be read now, because a record carries the target and not an offset.
-	if r.Mode&iofs.ModeSymlink != 0 && fileSize > 0 && fileSize < 1<<16 {
-		buf := make([]byte, fileSize)
-		if _, err := ra.ReadAt(buf, dataOff); err != nil {
+	if r.Mode&iofs.ModeSymlink != 0 && h.size > 0 && h.size < 1<<16 {
+		buf := make([]byte, h.size)
+		if _, err := ra.ReadAt(buf, h.dataOff); err != nil {
 			return nil, 0, err
 		}
 		r.Link = strings.TrimRight(string(buf), "\x00")
 		r.Size = 0
 	}
-	return r, next, nil
+	return r, h.next, nil
 }
 
 // FileMode turns a POSIX st_mode into an iofs.FileMode.
@@ -370,6 +409,7 @@ func readBinary(ra io.ReaderAt, size, off int64, order binary.ByteOrder) (*Recor
 	word := func(i int) int64 { return int64(order.Uint16(h[i*2 : i*2+2])) }
 	long := func(i int) int64 { return word(i)<<16 | word(i+1) } // high word first
 
+	ino := word(2)
 	mode := word(3)
 	mtime := long(8)
 	nameSize := word(10)
@@ -396,7 +436,10 @@ func readBinary(ra io.ReaderAt, size, off int64, order binary.ByteOrder) (*Recor
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
 			name, fileSize, ErrTruncated)
 	}
-	return newRecord(ra, name, mode, fileSize, dataOff, mtime, next)
+	return newRecord(ra, header{
+		name: name, mode: mode, size: fileSize, dataOff: dataOff,
+		mtime: mtime, ino: ino, next: next,
+	})
 }
 
 // round2 rounds up to the next even number.
