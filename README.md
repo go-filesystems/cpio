@@ -74,6 +74,30 @@ other drops every type bit. `FileMode` maps the seven `S_IF*` kinds, **and** set
 setgid and sticky — an archive records those, and a setuid binary read back as an
 ordinary one is a mode meaning something other than what was packed.
 
+## Two functions, because the two consumers are each right
+
+```go
+recs, err := cpio.Records(ra, size)       // an initramfs: block-padded, tolerant
+recs, err := cpio.RecordsExact(ra, size)  // an RPM payload: exact length, strict
+```
+
+| | `Records` | `RecordsExact` |
+|---|---|---|
+| zero padding after the trailer | accepted | accepted |
+| **non-zero** bytes after the trailer | accepted, stops there | **refused** |
+| junk where a header should be | accepted, stops there | **refused** |
+| no trailer at all | accepted | **refused** |
+
+An initramfs is padded to a block, so refusing the zeros after its trailer would
+refuse every one there is. An RPM payload has a length known exactly — from the end
+of the header to the end of the file — so anything unparsed in it is damage, and a
+reader that stops early and reports success hands back a package with files missing.
+
+⛔ `RecordsExact` first required the archive to end *exactly* at the trailer, which
+refuses everything `cpio(1)` writes: one clean fixture here has its trailer ending at
+756 inside a 1024-byte file. The rule is that the tail must be **zeros**, which keeps
+the padding and refuses the junk.
+
 ## Every numeric field is checked
 
 Not the three the parser happens to use. A header field that is not a number means
