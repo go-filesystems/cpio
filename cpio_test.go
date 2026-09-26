@@ -107,6 +107,15 @@ func TestEveryVariantReadsTheSameArchive(t *testing.T) {
 				if got[i].Link != want[i].Link {
 					t.Errorf("%s link = %q, want %q", got[i].Name, got[i].Link, want[i].Link)
 				}
+				// ⛔ The inode is NOT compared, and that is a measurement rather
+				// than a convenience. odc's field is six octal digits (0o777777
+				// max) and the binary variant's is a 16-bit word, so neither can
+				// hold a real one -- cpio(1) RENUMBERS them 1..n. The same tree
+				// came out as 257757054 in newc and as 1 in the other two.
+				//
+				// So "the same archive" means the same names, modes, sizes and link
+				// targets. The inode is checked for being read at all, separately,
+				// in TestTheInodeIsReadAndNotInvented.
 			}
 		})
 	}
@@ -563,5 +572,41 @@ func TestBinAndPwbAreTheSameFormatHere(t *testing.T) {
 		if ra[i].Name != rb[i].Name || ra[i].Size != rb[i].Size || ra[i].Mode != rb[i].Mode {
 			t.Errorf("record %d differs: %+v vs %+v", i, ra[i], rb[i])
 		}
+	}
+}
+
+// TestTheInodeIsReadAndNotInvented.
+//
+// go-filesystems/rpm reports it in Stat, so a parser that dropped it would force
+// that consumer to make one up -- a different number wearing the same name.
+//
+// ⛔ The assertion is that the inodes are DISTINCT and non-zero, not that they equal
+// particular values: the numbers are whatever the filesystem the archive was made
+// from handed out. A reader that returned zero for all of them, or the same number
+// for all of them, is what this catches -- and reading the wrong header field
+// usually gives exactly one of those two.
+func TestTheInodeIsReadAndNotInvented(t *testing.T) {
+	for _, fixture := range []string{"newc.cpio", "odc.cpio", "bin.cpio", "bin-swapped.cpio"} {
+		t.Run(fixture, func(t *testing.T) {
+			recs := records(t, read(t, fixture))
+			seen := map[uint64]string{}
+			for _, r := range recs {
+				if r.Inode == 0 {
+					t.Errorf("%s has inode 0, which no real entry does", r.Name)
+					continue
+				}
+				if other, dup := seen[r.Inode]; dup {
+					t.Errorf("%s and %s both have inode %d: the field read is not "+
+						"the inode, or it is the same one every time",
+						other, r.Name, r.Inode)
+					continue
+				}
+				seen[r.Inode] = r.Name
+			}
+			if len(seen) < 2 {
+				t.Errorf("%d distinct inodes across %d records, which cannot "+
+					"distinguish a real field from a constant", len(seen), len(recs))
+			}
+		})
 	}
 }
