@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-cpio.png" alt="go-filesystems/cpio" width="720"></p>
+
 # cpio
 
 Reads the records of a **cpio** archive, in all four variants, and stops there —
