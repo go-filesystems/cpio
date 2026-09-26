@@ -617,3 +617,145 @@ func TestTheInodeIsReadAndNotInvented(t *testing.T) {
 		})
 	}
 }
+
+// TestRecordsExactRefusesWhatRecordsTolerates.
+//
+// The two behaviours exist because the two consumers are each right about their own
+// case: an RPM payload has an exact length, so anything unparsed in it is damage; an
+// initramfs is block-padded, so the zeros after its trailer are not.
+//
+// Both are asserted against the SAME bytes, which is what makes this a difference
+// between the functions rather than between two fixtures.
+func TestRecordsExactRefusesWhatRecordsTolerates(t *testing.T) {
+	good := read(t, "newc.cpio")
+
+	// ⛔ ZERO padding is accepted by both, because that is what cpio(1) writes: this
+	// archive's trailer ends well before its 1024 bytes do. The first version of
+	// RecordsExact required the archive to end exactly at the trailer and therefore
+	// refused every archive the reference tool produces.
+	t.Run("zero padding after the trailer", func(t *testing.T) {
+		padded := append(append([]byte(nil), good...), make([]byte, 512)...)
+		for _, f := range []struct {
+			name string
+			fn   func(*bytes.Reader, int64) ([]Record, error)
+		}{{"Records", func(r *bytes.Reader, n int64) ([]Record, error) { return Records(r, n) }},
+			{"RecordsExact", func(r *bytes.Reader, n int64) ([]Record, error) { return RecordsExact(r, n) }}} {
+			if _, err := f.fn(bytes.NewReader(padded), int64(len(padded))); err != nil {
+				t.Errorf("%s refused a block-padded archive: %v", f.name, err)
+			}
+		}
+	})
+
+	t.Run("non-zero bytes after the trailer", func(t *testing.T) {
+		dirty := append(append([]byte(nil), good...), []byte("not padding")...)
+		if _, err := Records(bytes.NewReader(dirty), int64(len(dirty))); err != nil {
+			t.Errorf("Records refused it: %v", err)
+		}
+		if _, err := RecordsExact(bytes.NewReader(dirty), int64(len(dirty))); !errors.Is(err, ErrTruncated) {
+			t.Errorf("RecordsExact = %v, want ErrTruncated", err)
+		}
+	})
+
+	t.Run("junk where a header should be", func(t *testing.T) {
+		first := records(t, good)[0]
+		cut := int(first.Offset + first.Size)
+		junk := append(append([]byte(nil), good[:cut]...), []byte("not a header at all!")...)
+		if _, err := Records(bytes.NewReader(junk), int64(len(junk))); err != nil {
+			t.Errorf("Records refused it: %v", err)
+		}
+		if _, err := RecordsExact(bytes.NewReader(junk), int64(len(junk))); !errors.Is(err, ErrTruncated) {
+			t.Errorf("RecordsExact = %v, want ErrTruncated", err)
+		}
+	})
+
+	t.Run("no trailer at all", func(t *testing.T) {
+		// Cut where the TRAILER's header starts, so what is left is whole records
+		// and no trailer. Found by looking for the name rather than by arithmetic:
+		// a symlink's Size is reported as 0 with its target lifted out, so
+		// Offset+Size for the last record is not where its data ends.
+		at := bytes.Index(good, []byte(TrailerName))
+		if at < 0 {
+			t.Fatal("the fixture has no trailer, so this case has nothing to remove")
+		}
+		upTo := int64(at - 110) // the newc header that precedes the name
+		if upTo <= 0 {
+			t.Fatalf("the trailer name is at %d, too early for a header before it", at)
+		}
+		cut := good[:upTo]
+		if _, err := Records(bytes.NewReader(cut), upTo); err != nil {
+			t.Errorf("Records refused an archive with no trailer: %v", err)
+		}
+		_, err := RecordsExact(bytes.NewReader(cut), upTo)
+		if !errors.Is(err, ErrTruncated) {
+			t.Errorf("RecordsExact = %v, want ErrTruncated", err)
+		}
+		if err != nil && !bytes.Contains([]byte(err.Error()), []byte("no trailer")) {
+			t.Errorf("err = %v, want it to say which of the two rules was broken", err)
+		}
+	})
+
+	t.Run("and both accept a clean archive", func(t *testing.T) {
+		a, errA := Records(bytes.NewReader(good), int64(len(good)))
+		b, errB := RecordsExact(bytes.NewReader(good), int64(len(good)))
+		if errA != nil || errB != nil {
+			t.Fatalf("Records: %v, RecordsExact: %v", errA, errB)
+		}
+		if len(a) != len(b) {
+			t.Errorf("%d records from Records, %d from RecordsExact", len(a), len(b))
+		}
+	})
+}
+
+// TestRecordsExactPassesAParseFailureThrough. Its own two rules come after the walk,
+// so an archive that does not parse must still fail as a parse error rather than as
+// "no trailer" -- which would send a reader looking at the wrong end of the file.
+func TestRecordsExactPassesAParseFailureThrough(t *testing.T) {
+	b := corrupt(t, "newc.cpio", 6+1*8, "zzzzzzzz")
+	_, err := RecordsExact(bytes.NewReader(b), int64(len(b)))
+	if err == nil {
+		t.Fatal("a header of non-digits was accepted")
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("no trailer")) {
+		t.Errorf("err = %v, and it blames the end of the archive for a bad field "+
+			"at the start", err)
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("mode")) {
+		t.Errorf("err = %v, want the parse failure", err)
+	}
+}
+
+// TestAReadFailureInThePaddingIsReported. The padding check reads, so it can fail
+// the way any read can -- and a disk that stops mid-tail is not a damaged archive.
+func TestAReadFailureInThePaddingIsReported(t *testing.T) {
+	b := read(t, "newc.cpio")
+	// Everything up to the trailer is readable; the padding after it is not.
+	_, end, err := walkRecords(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		t.Fatalf("walkRecords: %v", err)
+	}
+	if end.at >= int64(len(b)) {
+		t.Skip("this archive has no padding after its trailer")
+	}
+	_, err = RecordsExact(failAt{b: b, after: end.at}, int64(len(b)))
+	if err == nil {
+		t.Fatal("a failed read of the padding was reported as a clean archive")
+	}
+	if errors.Is(err, ErrTruncated) {
+		t.Errorf("err = %v, want the read failure rather than a verdict about the "+
+			"archive", err)
+	}
+}
+
+// TestAllZeroSpansMoreThanOneChunk. The padding is read in 4 KiB pieces, so a tail
+// longer than one piece is the case where the loop's bookkeeping matters.
+func TestAllZeroSpansMoreThanOneChunk(t *testing.T) {
+	b := append(append([]byte(nil), read(t, "newc.cpio")...), make([]byte, 10<<10)...)
+	if _, err := RecordsExact(bytes.NewReader(b), int64(len(b))); err != nil {
+		t.Errorf("10 KiB of zero padding was refused: %v", err)
+	}
+	// And one non-zero byte in the second chunk is still found.
+	b[len(b)-1] = 1
+	if _, err := RecordsExact(bytes.NewReader(b), int64(len(b))); !errors.Is(err, ErrTruncated) {
+		t.Errorf("a non-zero byte in the last chunk gave %v, want ErrTruncated", err)
+	}
+}

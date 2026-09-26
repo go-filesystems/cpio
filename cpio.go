@@ -102,12 +102,79 @@ type Record struct {
 // trailer is normal -- an initramfs is padded to a block -- so what follows the
 // trailer is ignored rather than refused.
 func Records(ra io.ReaderAt, size int64) ([]Record, error) {
+	recs, _, err := walkRecords(ra, size)
+	return recs, err
+}
+
+// RecordsExact is Records for an archive whose length is known to be exact, and
+// refuses what Records tolerates.
+//
+// ⛔ The difference is not strictness for its own sake: the two consumers need
+// different answers and each is right about its own case.
+//
+//   - An RPM payload is a cpio of a known length, from the end of the header to the
+//     end of the file. Anything in it that does not parse is damage, and a reader
+//     that stops early and reports success hands back a package with files missing.
+//   - An initramfs is padded to a block. The bytes after the trailer are zeros
+//     nobody wrote, and refusing them would refuse every initramfs there is.
+//
+// So this requires a TRAILER record, and requires the archive to end there. Records
+// requires neither.
+func RecordsExact(ra io.ReaderAt, size int64) ([]Record, error) {
+	recs, end, err := walkRecords(ra, size)
+	if err != nil {
+		return nil, err
+	}
+	if !end.trailer {
+		return nil, fmt.Errorf("cpio: the archive ends at %d with no trailer: %w",
+			end.at, ErrTruncated)
+	}
+	// ⛔ What follows the trailer must be ZERO, not nothing. A clean archive from
+	// cpio(1) is padded to a 512-byte block -- measured: a trailer ending at 756
+	// inside a 1024-byte file -- so "ends exactly at size" refuses every archive
+	// the reference tool writes. Requiring the tail to be zeros keeps the padding
+	// and refuses the junk, which is the distinction that was wanted.
+	if err := allZero(ra, end.at, size); err != nil {
+		return nil, err
+	}
+	return recs, nil
+}
+
+// allZero reports whether everything from off to size is zero, which is what block
+// padding looks like and what damage does not.
+func allZero(ra io.ReaderAt, off, size int64) error {
+	const chunk = 4096
+	buf := make([]byte, chunk)
+	for off < size {
+		n := min(int64(chunk), size-off)
+		if _, err := ra.ReadAt(buf[:n], off); err != nil {
+			return err
+		}
+		for i, b := range buf[:n] {
+			if b != 0 {
+				return fmt.Errorf("cpio: byte %d after the trailer is 0x%02x, not "+
+					"padding: %w", off+int64(i), b, ErrTruncated)
+			}
+		}
+		off += n
+	}
+	return nil
+}
+
+// ending says how the walk stopped, which is the only thing RecordsExact needs that
+// Records does not.
+type ending struct {
+	trailer bool  // a TRAILER record was reached
+	at      int64 // the offset the walk stopped at
+}
+
+func walkRecords(ra io.ReaderAt, size int64) ([]Record, ending, error) {
 	var recs []Record
 	off := int64(0)
 	for off+6 <= size {
 		magic := make([]byte, 6)
 		if _, err := ra.ReadAt(magic, off); err != nil {
-			return nil, fmt.Errorf("cpio: header at %d: %w", off, err)
+			return nil, ending{}, fmt.Errorf("cpio: header at %d: %w", off, err)
 		}
 		var (
 			r    *Record
@@ -123,25 +190,30 @@ func Records(ra io.ReaderAt, size int64) ([]Record, error) {
 			order := binaryOrder(magic[:2])
 			if order == nil {
 				if off == 0 {
-					return nil, fmt.Errorf("cpio: %q is no cpio magic this reads: %w",
+					return nil, ending{}, fmt.Errorf("cpio: %q is no cpio magic this reads: %w",
 						magic, ErrNotCpio)
 				}
-				// Trailing padding after the trailer is normal. Stopping with what
-				// was read beats refusing the whole archive.
-				return done(recs)
+				// Trailing padding after the trailer is normal for an initramfs, so
+				// Records stops with what it read. RecordsExact refuses it, because
+				// a payload of an exact length has no padding to explain it.
+				r, err := done(recs)
+				return r, ending{at: off}, err
 			}
 			r, next, err = readBinary(ra, size, off, order)
 		}
 		if err != nil {
-			return nil, err
+			return nil, ending{}, err
 		}
 		if r == nil {
-			return done(recs)
+			// The trailer, which is the only clean way an archive ends.
+			rs, err := done(recs)
+			return rs, ending{trailer: true, at: next}, err
 		}
 		recs = append(recs, *r)
 		off = next
 	}
-	return done(recs)
+	rs, err := done(recs)
+	return rs, ending{at: off}, err
 }
 
 func done(recs []Record) ([]Record, error) {
