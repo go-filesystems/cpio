@@ -148,6 +148,21 @@ const (
 // So the order is DETECTED from the magic rather than assumed, and both are read.
 // Guessing silently misreads every field of an archive written on the other kind of
 // machine.
+// The magics and the trailer name, exported because a WRITER needs them and they
+// are facts about the format rather than about this reader.
+//
+// go-filesystems/unarchive writes newc, and had its own copies of these three until
+// the parser moved here -- which is the duplication this package exists to end, one
+// string constant included.
+const (
+	MagicNewc = magicNewc
+	MagicCRC  = magicCRC
+	MagicODC  = magicODC
+	// TrailerName is the name of the record that ends an archive. It is the NAME,
+	// not a magic: the trailer is an ordinary header whose name says stop.
+	TrailerName = trailerName
+)
+
 const binaryMagic = 0o070707
 
 // binaryHeaderLen is thirteen 16-bit words.

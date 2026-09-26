@@ -360,6 +360,12 @@ func TestABinaryHeaderCutShortIsRefused(t *testing.T) {
 // TestAReadFailureIsReportedAsItself. A checksum or a length can be wrong; a disk
 // can also simply fail, and the two must not read alike. Every ReadAt in the parser
 // sits behind a size check, so a short slice cannot reach these -- hence failAt.
+//
+// ⚠ These thresholds are fixture-dependent: regenerating testdata moves the offsets,
+// and a case can then fail at an EARLIER read than the one it names while still
+// passing. What catches that is the 100% coverage gate -- a case that stops reaching
+// its branch shows up as a drop, not as a green test. One of them did exactly that
+// and is derived from the archive now; see TestAFailureReadingASymlinkTargetIsReported.
 func TestAReadFailureIsReportedAsItself(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -369,7 +375,7 @@ func TestAReadFailureIsReportedAsItself(t *testing.T) {
 		{"the magic", "newc.cpio", 3},
 		{"a newc header", "newc.cpio", 60},
 		{"a newc name", "newc.cpio", 111},
-		{"a newc symlink target", "newc.cpio", 490},
+
 		{"an odc header", "odc.cpio", 40},
 		{"an odc name", "odc.cpio", 77},
 		{"a binary header", "bin.cpio", 20},
@@ -427,5 +433,66 @@ func TestAnODCRecordDeclaringDataPastTheEnd(t *testing.T) {
 	b := corrupt(t, "odc.cpio", 6+9*6+5, "77777777777")
 	if _, err := Records(bytes.NewReader(b), int64(len(b))); !errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want ErrTruncated", err)
+	}
+}
+
+// TestTheExportedMagicsAreTheOnesTheParserSwitchesOn. Two spellings of one constant
+// is the duplication this package removed; a copy inside it would be the same
+// defect at a shorter distance.
+func TestTheExportedMagicsAreTheOnesTheParserSwitchesOn(t *testing.T) {
+	for _, c := range []struct{ exported, internal, name string }{
+		{MagicNewc, magicNewc, "MagicNewc"},
+		{MagicCRC, magicCRC, "MagicCRC"},
+		{MagicODC, magicODC, "MagicODC"},
+		{TrailerName, trailerName, "TrailerName"},
+	} {
+		if c.exported != c.internal {
+			t.Errorf("%s = %q but the parser switches on %q", c.name, c.exported, c.internal)
+		}
+	}
+	// And a writer using them produces something this parser reads: the magic is
+	// what the switch above dispatches on, so an archive written with MagicNewc
+	// must come back as records rather than as ErrNotCpio.
+	b := append([]byte(nil), read(t, "newc.cpio")...)
+	copy(b[:6], MagicNewc)
+	if _, err := Records(bytes.NewReader(b), int64(len(b))); err != nil {
+		t.Errorf("an archive whose magic is MagicNewc was refused: %v", err)
+	}
+}
+
+// TestAFailureReadingASymlinkTargetIsReported.
+//
+// ⛔ The threshold is DERIVED from the archive rather than written down. It was a
+// constant at first, and regenerating the fixtures moved the link's data offset from
+// 488 to 624 -- so the case went on passing while failing at the NAME read instead,
+// and the branch it exists for stopped being reached.
+//
+// A symlink's target is its data, so this is the one read the parser makes that a
+// caller cannot make for itself.
+func TestAFailureReadingASymlinkTargetIsReported(t *testing.T) {
+	b := read(t, "newc.cpio")
+	var link Record
+	for _, r := range records(t, b) {
+		if r.Link != "" {
+			link = r
+			break
+		}
+	}
+	if link.Link == "" {
+		t.Fatal("the archive holds no symbolic link, so this cannot test reading one")
+	}
+	// Everything up to the target's last byte is readable; the target is not.
+	after := link.Offset + int64(len(link.Link)) - 1
+
+	_, err := Records(failAt{b: b, after: after}, int64(len(b)))
+	if err == nil {
+		t.Fatal("a failed read of a link target was reported as a successful parse")
+	}
+	if errors.Is(err, ErrNotCpio) || errors.Is(err, ErrTruncated) {
+		t.Errorf("err = %v, want the read failure itself", err)
+	}
+	// Premise: one byte more and it succeeds, so the failure is about THAT read.
+	if _, err := Records(failAt{b: b, after: int64(len(b))}, int64(len(b))); err != nil {
+		t.Errorf("the same archive fails with nothing withheld: %v", err)
 	}
 }
