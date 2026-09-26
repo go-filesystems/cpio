@@ -9,6 +9,10 @@ import (
 	"encoding/binary"
 	"errors"
 	iofs "io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -494,5 +498,70 @@ func TestAFailureReadingASymlinkTargetIsReported(t *testing.T) {
 	// Premise: one byte more and it succeeds, so the failure is about THAT read.
 	if _, err := Records(failAt{b: b, after: int64(len(b))}, int64(len(b))); err != nil {
 		t.Errorf("the same archive fails with nothing withheld: %v", err)
+	}
+}
+
+// TestBinAndPwbAreTheSameFormatHere.
+//
+// ⛔ A measurement carried over from go-filesystems/unarchive, where the parser used
+// to live. libarchive lists `bin` and `pwb` as separate cpio formats, so it was
+// worth asking rather than assuming -- and on this machine cpio(1) writes
+// BYTE-IDENTICAL headers for both. One implementation therefore serves both, and
+// that is a fact about the tool rather than a claim about the formats in general.
+//
+// It is asserted rather than left in a comment, because a cpio(1) that started
+// distinguishing them would otherwise be discovered by a user rather than here.
+func TestBinAndPwbAreTheSameFormatHere(t *testing.T) {
+	bin, err := exec.LookPath("cpio")
+	if err != nil {
+		t.Skip("no cpio here to compare the two variants with")
+	}
+	tree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tree, "one.txt"), []byte("a body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(variant string) []byte {
+		t.Helper()
+		cmd := exec.Command(bin, "-o", "-H", variant)
+		cmd.Dir = tree
+		cmd.Stdin = strings.NewReader("one.txt\n")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Skipf("cpio -H %s: %v", variant, err)
+		}
+		return out
+	}
+	a, b := write("bin"), write("pwb")
+
+	// The mtime is in the header, so two runs a second apart differ legitimately.
+	// The comparison is of the FIELDS that describe the format, which is the first
+	// 16 bytes plus the name and data sizes -- everything but mtime.
+	const hdr = binaryHeaderLen
+	if len(a) < hdr || len(b) < hdr {
+		t.Fatalf("headers are %d and %d bytes, want at least %d", len(a), len(b), hdr)
+	}
+	if !bytes.Equal(a[:16], b[:16]) {
+		t.Errorf("bin and pwb differ in their first 16 header bytes:\n  bin % x\n  pwb % x",
+			a[:16], b[:16])
+	}
+	if !bytes.Equal(a[20:26], b[20:26]) {
+		t.Errorf("bin and pwb differ in their name and data sizes:\n  bin % x\n  pwb % x",
+			a[20:26], b[20:26])
+	}
+
+	// And both parse to the same record, which is the answer that matters.
+	ra, errA := Records(bytes.NewReader(a), int64(len(a)))
+	rb, errB := Records(bytes.NewReader(b), int64(len(b)))
+	if errA != nil || errB != nil {
+		t.Fatalf("bin: %v, pwb: %v", errA, errB)
+	}
+	if len(ra) != len(rb) {
+		t.Fatalf("%d records from bin, %d from pwb", len(ra), len(rb))
+	}
+	for i := range ra {
+		if ra[i].Name != rb[i].Name || ra[i].Size != rb[i].Size || ra[i].Mode != rb[i].Mode {
+			t.Errorf("record %d differs: %+v vs %+v", i, ra[i], rb[i])
+		}
 	}
 }
