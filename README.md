@@ -74,6 +74,17 @@ other drops every type bit. `FileMode` maps the seven `S_IF*` kinds, **and** set
 setgid and sticky — an archive records those, and a setuid binary read back as an
 ordinary one is a mode meaning something other than what was packed.
 
+## Every numeric field is checked
+
+Not the three the parser happens to use. A header field that is not a number means
+the header is not a header, and reading it as zero gives a record that looks ordinary
+and is not — an mtime of 1970 and an inode of 0 are both perfectly representable.
+
+⛔ The two readers this package replaced **disagreed** about that: `rpm` checked all
+of them, `unarchive` ignored the errors on inode and mtime. The strict one is right,
+and it was the one tested against real packages. Consolidating on the lenient
+behaviour would have been a regression that no test in either repository could see.
+
 ## Errors
 
 | | |

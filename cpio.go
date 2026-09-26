@@ -41,6 +41,15 @@ import (
 	"time"
 )
 
+// ⛔ EVERY numeric field is checked, not the three the parser happens to use. A
+// header field that is not a number means the header is not a header, and reading it
+// as zero gives a record that looks ordinary and is not -- an mtime of 1970 and an
+// inode of 0 are both perfectly representable.
+//
+// Two readers disagreed about this before they were merged: go-filesystems/rpm
+// checked all of them, go-filesystems/unarchive ignored the errors on inode and
+// mtime. The strict one is right, and it was the one tested against real packages.
+//
 // ErrNotCpio is returned when the bytes do not begin with any cpio magic.
 var ErrNotCpio = errors.New("cpio: not a cpio archive")
 
@@ -195,12 +204,18 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	field := func(i int) (int64, error) {
 		return strconv.ParseInt(string(h[6+i*8:6+i*8+8]), 16, 64)
 	}
-	ino, _ := field(0)
+	ino, err := field(0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cpio: inode at %d: %w", off, err)
+	}
 	mode, err := field(1)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: mode at %d: %w", off, err)
 	}
-	mtime, _ := field(5)
+	mtime, err := field(5)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cpio: mtime at %d: %w", off, err)
+	}
 	fileSize, err := field(6)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: size at %d: %w", off, err)
@@ -250,7 +265,10 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	oct := func(start, width int) (int64, error) {
 		return strconv.ParseInt(strings.TrimSpace(string(h[start:start+width])), 8, 64)
 	}
-	ino, _ := oct(12, 6)
+	ino, err := oct(12, 6)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cpio: inode at %d: %w", off, err)
+	}
 	mode, err := oct(18, 6)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: mode at %d: %w", off, err)
@@ -259,7 +277,10 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: name size at %d: %w", off, err)
 	}
-	mtime, _ := oct(48, 11)
+	mtime, err := oct(48, 11)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cpio: mtime at %d: %w", off, err)
+	}
 	fileSize, err := oct(65, 11)
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: size at %d: %w", off, err)

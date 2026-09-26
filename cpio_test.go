@@ -303,9 +303,16 @@ func TestAFieldThatIsNotANumberIsRefused(t *testing.T) {
 		with     string
 		wantWord string
 	}{
+		// ⛔ Every field, not the three the parser uses. inode and mtime had their
+		// errors IGNORED until the two readers were merged, so a header whose inode
+		// was not hex parsed to inode 0 and looked ordinary.
+		{"newc inode", "newc.cpio", 6 + 0*8, "zzzzzzzz", "inode"},
+		{"newc mtime", "newc.cpio", 6 + 5*8, "zzzzzzzz", "mtime"},
 		{"newc mode", "newc.cpio", 6 + 1*8, "zzzzzzzz", "mode"},
 		{"newc size", "newc.cpio", 6 + 6*8, "zzzzzzzz", "size"},
 		{"newc name size", "newc.cpio", 6 + 11*8, "zzzzzzzz", "name size"},
+		{"odc inode", "odc.cpio", 12, "zzzzzz", "inode"},
+		{"odc mtime", "odc.cpio", 48, "zzzzzzzzzzz", "mtime"},
 		{"odc mode", "odc.cpio", 6 + 2*6, "zzzzzz", "mode"},
 		{"odc name size", "odc.cpio", 6 + 8*6, "zzzzzz", "name size"},
 		{"odc size", "odc.cpio", 6 + 9*6 + 5, "zzzzzzzzzzz", "size"},
