@@ -56,10 +56,15 @@ jobs:
       # since the test was written. A green lane over a skipped judge looks
       # exactly like a green lane over a passing one.
       #
+      # It has to be LIBARCHIVE's cpio. The runners carry GNU cpio, which has
+      # no `pwb` format — `cpio -H pwb` exits 2 — so with it the test skipped
+      # twice over and asserted nothing. Measured on the runner in this very
+      # pull request before the package was changed.
+      #
       # Found by go-fleettools/judgescan, which reads which tools the tests
       # reach for and which ones the workflows install.
       - name: Install the foreign judge
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq cpio
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools
 
       - name: Test (race + coverage)
         run: go test -race -covermode=atomic -coverprofile=cover.out -timeout 5m ./...
