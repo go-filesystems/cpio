@@ -48,8 +48,40 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # ⛔ THE ONE FOREIGN JUDGE IN THIS REPOSITORY HAS NEVER RUN.
+      # TestBinAndPwbAreTheSameFormatHere skips itself when cpio(1) is not on
+      # PATH, and this CI never installed it — so the assertion its own comment
+      # calls out ("a cpio(1) that started distinguishing them would otherwise
+      # be discovered by a user rather than here") has been discovering nothing
+      # since the test was written. A green lane over a skipped judge looks
+      # exactly like a green lane over a passing one.
+      #
+      # It has to be LIBARCHIVE's cpio. The runners carry GNU cpio, which has
+      # no `pwb` format — `cpio -H pwb` exits 2 — so with it the test skipped
+      # twice over and asserted nothing. Measured on the runner in this very
+      # pull request before the package was changed.
+      #
+      # Found by go-fleettools/judgescan, which reads which tools the tests
+      # reach for and which ones the workflows install.
+      - name: Install the foreign judge
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools
+
       - name: Test (race + coverage)
         run: go test -race -covermode=atomic -coverprofile=cover.out -timeout 5m ./...
+
+      # A skip is not a pass, and the difference is invisible in the summary
+      # line. If the judge stops being installed, or the test starts skipping
+      # for some other reason, this says so instead of going quietly green.
+      - name: The judge must have judged
+        run: |
+          set -euo pipefail
+          out=$(go test -run TestBinAndPwbAreTheSameFormatHere -v . 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          case "$out" in
+            *"--- SKIP"*) echo "::error::the cpio(1) comparison skipped; the judge is not installed"; exit 1 ;;
+            *"--- PASS"*) ;;
+            *) echo "::error::the cpio(1) comparison neither passed nor skipped"; exit 1 ;;
+          esac
 
       - name: Enforce coverage floor
         run: |

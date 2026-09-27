@@ -527,8 +527,21 @@ func TestAFailureReadingASymlinkTargetIsReported(t *testing.T) {
 //
 // It is asserted rather than left in a comment, because a cpio(1) that started
 // distinguishing them would otherwise be discovered by a user rather than here.
+//
+// ⛔ IT HAS TO BE LIBARCHIVE'S. GNU cpio has no `pwb` format at all —
+// `cpio -H pwb` exits 2 — so under it this test skipped twice over and
+// asserted nothing. That is not a fact about the formats; it is the reason the
+// question only has an answer for the implementation that names both. The
+// runners carry GNU cpio, so CI installs libarchive-tools and this looks for
+// bsdcpio first. Measured on the runner, not assumed: 2026-09-27,
+// go-filesystems/cpio#9.
 func TestBinAndPwbAreTheSameFormatHere(t *testing.T) {
-	bin, err := exec.LookPath("cpio")
+	bin, err := exec.LookPath("bsdcpio")
+	if err != nil {
+		// On macOS, and anywhere libarchive supplies the only cpio(1), the
+		// plain name IS bsdcpio.
+		bin, err = exec.LookPath("cpio")
+	}
 	if err != nil {
 		t.Skip("no cpio here to compare the two variants with")
 	}
@@ -544,7 +557,12 @@ func TestBinAndPwbAreTheSameFormatHere(t *testing.T) {
 		cmd.Stdin = strings.NewReader("one.txt\n")
 		out, err := cmd.Output()
 		if err != nil {
-			t.Skipf("cpio -H %s: %v", variant, err)
+			// ⛔ Not a skip. A cpio(1) that refuses one of the two names is
+			// the interesting answer, not a reason to say nothing: GNU cpio
+			// refuses `pwb`, and this skipping quietly is how the assertion
+			// went four months without running.
+			t.Fatalf("%s -H %s: %v — this test needs a cpio(1) that knows both "+
+				"names, which today means libarchive's", bin, variant, err)
 		}
 		return out
 	}
