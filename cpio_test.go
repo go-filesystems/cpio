@@ -747,7 +747,7 @@ func TestRecordsExactPassesAParseFailureThrough(t *testing.T) {
 func TestAReadFailureInThePaddingIsReported(t *testing.T) {
 	b := read(t, "newc.cpio")
 	// Everything up to the trailer is readable; the padding after it is not.
-	_, end, err := walkRecords(bytes.NewReader(b), int64(len(b)))
+	_, end, err := walkRecords(bytes.NewReader(b), int64(len(b)), 0)
 	if err != nil {
 		t.Fatalf("walkRecords: %v", err)
 	}

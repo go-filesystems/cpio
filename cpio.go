@@ -119,7 +119,18 @@ type Record struct {
 // trailer is normal -- an initramfs is padded to a block -- so what follows the
 // trailer is ignored rather than refused.
 func Records(ra io.ReaderAt, size int64) ([]Record, error) {
-	recs, _, err := walkRecords(ra, size)
+	recs, _, err := walkRecords(ra, size, 0)
+	return recs, err
+}
+
+// RecordsLimit is Records for a caller that cannot afford the list of an archive
+// of any size: it stops with ErrTooLarge as soon as the archive holds more than
+// maxRecords records, before it has built them all. A record costs about 100 bytes
+// and the smallest is 28 bytes of archive, so an unlimited walk of a 1 GiB archive
+// holds up to 3.8 GB of Records; a decompressor that has already inflated its input
+// (go-filesystems/rpm) is exactly such a caller. maxRecords <= 0 means no limit.
+func RecordsLimit(ra io.ReaderAt, size int64, maxRecords int) ([]Record, error) {
+	recs, _, err := walkRecords(ra, size, maxRecords)
 	return recs, err
 }
 
@@ -138,7 +149,12 @@ func Records(ra io.ReaderAt, size int64) ([]Record, error) {
 // So this requires a TRAILER record, and requires the archive to end there. Records
 // requires neither.
 func RecordsExact(ra io.ReaderAt, size int64) ([]Record, error) {
-	recs, end, err := walkRecords(ra, size)
+	return RecordsExactLimit(ra, size, 0)
+}
+
+// RecordsExactLimit is RecordsExact with the record ceiling of RecordsLimit.
+func RecordsExactLimit(ra io.ReaderAt, size int64, maxRecords int) ([]Record, error) {
+	recs, end, err := walkRecords(ra, size, maxRecords)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +201,7 @@ type ending struct {
 	at      int64 // the offset the walk stopped at
 }
 
-func walkRecords(ra io.ReaderAt, size int64) ([]Record, ending, error) {
+func walkRecords(ra io.ReaderAt, size int64, maxRecords int) ([]Record, ending, error) {
 	var recs []Record
 	off := int64(0)
 	for off+6 <= size {
@@ -225,6 +241,9 @@ func walkRecords(ra io.ReaderAt, size int64) ([]Record, ending, error) {
 			// The trailer, which is the only clean way an archive ends.
 			rs, err := done(recs)
 			return rs, ending{trailer: true, at: next}, err
+		}
+		if maxRecords > 0 && len(recs) >= maxRecords {
+			return nil, ending{}, fmt.Errorf("cpio: more than %d records: %w", maxRecords, ErrTooLarge)
 		}
 		recs = append(recs, *r)
 		off = next

@@ -123,6 +123,11 @@ it happens:
 | file data | never read: a `Record` points at it |
 | the record list | one `Record` per 28 bytes of archive at most; measured 21× the input in allocations at worst, for the smallest binary record |
 
+A caller that cannot afford the list of an archive of any size — one that has already
+inflated a compressed payload, like `go-filesystems/rpm` — uses `RecordsLimit` /
+`RecordsExactLimit`, which stop with `ErrTooLarge` as soon as the archive holds more
+than the given number of records, before the list is built.
+
 ⛔ Every numeric field is **unsigned**. `ParseInt` took a sign, and a size of
 `-0000070` made the next header land back at offset 0: the walk re-read record one
 for ever, appending a record each time — 10 001 reads and still going, for a
