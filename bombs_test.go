@@ -222,6 +222,35 @@ func TestManyRecordsCostBoundedMemory(t *testing.T) {
 	}
 }
 
+// TestTheRecordCeilingIsExact: n records pass a limit of n and fail a limit of
+// n-1, on both entry points and on every fixture; a limit of 0 means none; and the
+// refusal comes before the list is built (nothing is returned with the error).
+func TestTheRecordCeilingIsExact(t *testing.T) {
+	for _, name := range []string{"newc.cpio", "odc.cpio", "bin.cpio", "bin-swapped.cpio"} {
+		t.Run(name, func(t *testing.T) {
+			b := read(t, name)
+			ra := bytes.NewReader(b)
+			all, err := Records(ra, int64(len(b)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := len(all)
+			for _, f := range []func(io.ReaderAt, int64, int) ([]Record, error){RecordsLimit, RecordsExactLimit} {
+				if got, err := f(ra, int64(len(b)), n); err != nil || len(got) != n {
+					t.Errorf("limit %d: %d records, %v", n, len(got), err)
+				}
+				got, err := f(ra, int64(len(b)), n-1)
+				if !errors.Is(err, ErrTooLarge) || got != nil {
+					t.Errorf("limit %d: %v, %v; want nil and ErrTooLarge", n-1, got, err)
+				}
+				if got, err := f(ra, int64(len(b)), 0); err != nil || len(got) != n {
+					t.Errorf("limit 0 (none): %d records, %v", len(got), err)
+				}
+			}
+		})
+	}
+}
+
 // TestASymlinkTargetPastTheEndAllocatesNothing: the header claims a 64 KiB target
 // the archive does not carry; the past-the-end test refuses it before the buffer.
 func TestASymlinkTargetPastTheEndAllocatesNothing(t *testing.T) {
