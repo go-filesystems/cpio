@@ -111,12 +111,34 @@ of them, `unarchive` ignored the errors on inode and mtime. The strict one is ri
 and it was the one tested against real packages. Consolidating on the lenient
 behaviour would have been a regression that no test in either repository could see.
 
+## Untrusted input
+
+An archive is read as hostile. Every allocation a header can size is bounded before
+it happens:
+
+| What the header sizes | Bound |
+|---|---|
+| a name | `MaxNameSize` = 1 MiB (libarchive's `CPIO_PATHNAME_MAX`; the kernel's initramfs unpacker allows only `PATH_MAX`), and it must lie inside the archive |
+| a symlink target | read only below 64 KiB, and only if it lies inside the archive |
+| file data | never read: a `Record` points at it |
+| the record list | one `Record` per 28 bytes of archive at most; measured 21× the input in allocations at worst, for the smallest binary record |
+
+⛔ Every numeric field is **unsigned**. `ParseInt` took a sign, and a size of
+`-0000070` made the next header land back at offset 0: the walk re-read record one
+for ever, appending a record each time — 10 001 reads and still going, for a
+112-byte input. Fixed with `ParseUint`; `FuzzRecords` and
+`TestANegativeSizeCannotMakeTheWalkGoBackwards` pin it.
+
+Names are kept out of error messages beyond 80 bytes. Run `go test -fuzz FuzzRecords`
+to fuzz both entry points.
+
 ## Errors
 
 | | |
 |---|---|
 | `ErrNotCpio` | the bytes begin with no cpio magic — try another reader |
 | `ErrTruncated` | a header, a name or a record's data runs past the end — this archive is damaged |
+| `ErrTooLarge` | a header declares a name longer than `MaxNameSize` (1 MiB) |
 
 They say different things and a caller acts differently on them, so six bytes of
 newc magic and nothing else is **truncated**, not unrecognised.

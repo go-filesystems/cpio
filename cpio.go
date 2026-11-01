@@ -56,6 +56,23 @@ var ErrNotCpio = errors.New("cpio: not a cpio archive")
 // ErrTruncated is returned when a header or a name runs past the end.
 var ErrTruncated = errors.New("cpio: the archive ends inside a record")
 
+// ErrTooLarge is returned when a header declares a size this reader refuses to
+// allocate for -- see MaxNameSize.
+var ErrTooLarge = errors.New("cpio: a declared size is over the ceiling")
+
+// MaxNameSize is the longest name this reader allocates for. It is libarchive's
+// CPIO_PATHNAME_MAX (1 MiB, archive_read_support_format_cpio.c); the Linux kernel's
+// initramfs unpacker is stricter still (init/initramfs.c: name_len > PATH_MAX is an
+// error). Only newc can declare more: its name size is 8 hex digits, where odc's is
+// six octal digits (at most 262143) and the binary variant's a 16-bit word.
+//
+// Nothing else in a header sizes an allocation: the data is never read (a Record
+// points at it), a symlink target is read only when it is under 64 KiB, and both
+// are checked to lie inside the archive first. So the memory Records takes is
+// bounded by the archive's own length -- at most one Record per 28 bytes -- and a
+// name by min(MaxNameSize, what the archive holds).
+const MaxNameSize = 1 << 20
+
 // Record is one entry, with its data left where it lies.
 //
 // Offset points into the reader Records was given, so a caller can hand out a
@@ -263,6 +280,48 @@ const binaryMagic = 0o070707
 // binaryHeaderLen is thirteen 16-bit words.
 const binaryHeaderLen = 26
 
+// unsigned parses a header field, which is never negative.
+//
+// ⛔ strconv.ParseInt accepts a sign, and a size of "-0000070" is a sum that lands
+// the next header back at offset 0: the walk then re-read record one for ever and
+// appended a record each time. Measured before this existed: 10001 reads and still
+// going, for a 112-byte input. ParseUint refuses "-" and "+", and a field is at most
+// 11 octal digits (2^33), so nothing it returns can overflow an int64 sum.
+func unsigned(s string, base int) (int64, error) {
+	v, err := strconv.ParseUint(s, base, 62)
+	return int64(v), err
+}
+
+// readName reads the name that follows a header. what names the variant in errors.
+//
+// The size is checked against MaxNameSize BEFORE the buffer is made, and against the
+// archive's length too, so the buffer is never larger than the smaller of the two.
+// The name itself is kept out of error messages: it is attacker-chosen and up to
+// MaxNameSize long.
+func readName(ra io.ReaderAt, size, off, headerLen, nameSize int64, what string) (string, error) {
+	if nameSize > MaxNameSize {
+		return "", fmt.Errorf("cpio: %s at %d is %d bytes, over the %d ceiling: %w",
+			what, off, nameSize, MaxNameSize, ErrTooLarge)
+	}
+	if nameSize <= 0 || off+headerLen+nameSize > size {
+		return "", fmt.Errorf("cpio: %s at %d is %d bytes: %w", what, off, nameSize, ErrTruncated)
+	}
+	buf := make([]byte, nameSize)
+	if _, err := ra.ReadAt(buf, off+headerLen); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(buf), "\x00"), nil
+}
+
+// shown is a name fit for an error message.
+func shown(name string) string {
+	const max = 80
+	if len(name) > max {
+		return name[:max] + "..."
+	}
+	return name
+}
+
 // readNewc reads one SVR4 header. A nil record means the trailer was reached.
 func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	const headerLen = 110
@@ -274,7 +333,7 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 		return nil, 0, err
 	}
 	field := func(i int) (int64, error) {
-		return strconv.ParseInt(string(h[6+i*8:6+i*8+8]), 16, 64)
+		return unsigned(string(h[6+i*8:6+i*8+8]), 16)
 	}
 	ino, err := field(0)
 	if err != nil {
@@ -296,14 +355,10 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: name size at %d: %w", off, err)
 	}
-	if nameSize <= 0 || off+headerLen+nameSize > size {
-		return nil, 0, fmt.Errorf("cpio: name at %d is %d bytes: %w", off, nameSize, ErrTruncated)
-	}
-	nameBuf := make([]byte, nameSize)
-	if _, err := ra.ReadAt(nameBuf, off+headerLen); err != nil {
+	name, err := readName(ra, size, off, headerLen, nameSize, "name")
+	if err != nil {
 		return nil, 0, err
 	}
-	name := strings.TrimRight(string(nameBuf), "\x00")
 	// ⛔ Both the name and the data are padded to a multiple of four, and the
 	// padding is counted from the START of the header rather than from the field.
 	// Rounding the wrong origin puts every later header one to three bytes out,
@@ -315,7 +370,7 @@ func readNewc(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	}
 	if dataOff+fileSize > size {
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
-			name, fileSize, ErrTruncated)
+			shown(name), fileSize, ErrTruncated)
 	}
 	return newRecord(ra, header{
 		name: name, mode: mode, size: fileSize, dataOff: dataOff,
@@ -335,7 +390,7 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	}
 	// Field widths differ from newc's: 6 for most, 11 for mtime and filesize.
 	oct := func(start, width int) (int64, error) {
-		return strconv.ParseInt(strings.TrimSpace(string(h[start:start+width])), 8, 64)
+		return unsigned(strings.TrimSpace(string(h[start:start+width])), 8)
 	}
 	ino, err := oct(12, 6)
 	if err != nil {
@@ -357,14 +412,10 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("cpio: size at %d: %w", off, err)
 	}
-	if nameSize <= 0 || off+headerLen+nameSize > size {
-		return nil, 0, fmt.Errorf("cpio: name at %d is %d bytes: %w", off, nameSize, ErrTruncated)
-	}
-	nameBuf := make([]byte, nameSize)
-	if _, err := ra.ReadAt(nameBuf, off+headerLen); err != nil {
+	name, err := readName(ra, size, off, headerLen, nameSize, "name")
+	if err != nil {
 		return nil, 0, err
 	}
-	name := strings.TrimRight(string(nameBuf), "\x00")
 	// odc pads NOTHING, which is the difference from newc that matters most.
 	dataOff := off + headerLen + nameSize
 	next := dataOff + fileSize
@@ -373,7 +424,7 @@ func readODC(ra io.ReaderAt, size, off int64) (*Record, int64, error) {
 	}
 	if dataOff+fileSize > size {
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
-			name, fileSize, ErrTruncated)
+			shown(name), fileSize, ErrTruncated)
 	}
 	return newRecord(ra, header{
 		name: name, mode: mode, size: fileSize, dataOff: dataOff,
@@ -508,15 +559,10 @@ func readBinary(ra io.ReaderAt, size, off int64, order binary.ByteOrder) (*Recor
 	nameSize := word(10)
 	fileSize := long(11)
 
-	if nameSize <= 0 || off+binaryHeaderLen+nameSize > size {
-		return nil, 0, fmt.Errorf("cpio: binary name at %d is %d bytes: %w",
-			off, nameSize, ErrTruncated)
-	}
-	nameBuf := make([]byte, nameSize)
-	if _, err := ra.ReadAt(nameBuf, off+binaryHeaderLen); err != nil {
+	name, err := readName(ra, size, off, binaryHeaderLen, nameSize, "binary name")
+	if err != nil {
 		return nil, 0, err
 	}
-	name := strings.TrimRight(string(nameBuf), "\x00")
 
 	// The name and the data are each padded to an EVEN offset, not to four as newc
 	// does. Rounding to four reads the data two bytes late on half the entries.
@@ -527,7 +573,7 @@ func readBinary(ra io.ReaderAt, size, off int64, order binary.ByteOrder) (*Recor
 	}
 	if dataOff+fileSize > size {
 		return nil, 0, fmt.Errorf("cpio: %s says %d bytes, past the end: %w",
-			name, fileSize, ErrTruncated)
+			shown(name), fileSize, ErrTruncated)
 	}
 	return newRecord(ra, header{
 		name: name, mode: mode, size: fileSize, dataOff: dataOff,
