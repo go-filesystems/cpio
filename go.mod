@@ -1,3 +1,3 @@
 module github.com/go-filesystems/cpio
 
-go 1.27.1
+go 1.27.4
